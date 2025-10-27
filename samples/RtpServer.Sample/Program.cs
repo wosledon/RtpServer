@@ -14,8 +14,36 @@ var rtpPort = int.TryParse(Environment.GetEnvironmentVariable("RTP_PORT"), out v
 var broadcaster = new PayloadBroadcaster();
 var cts = new CancellationTokenSource();
 
-// Start UDP listener in background
-_ = Task.Run(() => UdpListenerLoop(rtpPort, broadcaster, cts.Token));
+// Start library RtpServer and subscribe to parsed packets
+var rtpServer = new RtpServer.RtpServer(rtpPort);
+// converters per SSRC
+var converters = new System.Collections.Concurrent.ConcurrentDictionary<uint, RtpServer.Flv.H264RtpToFlvConverter>();
+uint latestSsrc = 0;
+var loggerFactory = app.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>();
+
+rtpServer.PacketReceived += (s, pkt) =>
+{
+    try
+    {
+        if (pkt == null) return;
+        app.Logger.LogDebug("PacketReceived ssrc={Ssrc} seq={Seq} ts={Ts} payloadLen={Len}", pkt.Ssrc, pkt.SequenceNumber, pkt.Timestamp, pkt.Payload?.Length ?? 0);
+        var conv = converters.GetOrAdd(pkt.Ssrc, _ => {
+            latestSsrc = pkt.Ssrc;
+            var log = loggerFactory.CreateLogger($"H264Conv-{pkt.Ssrc}");
+            return new RtpServer.Flv.H264RtpToFlvConverter(log);
+        });
+        latestSsrc = pkt.Ssrc;
+        foreach (var flv in conv.ProcessRtpPacket(pkt))
+        {
+            broadcaster.Broadcast(flv);
+        }
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogWarning(ex, "Exception in PacketReceived handler");
+    }
+};
+_ = Task.Run(() => rtpServer.StartAsync(cts.Token));
 
 app.MapGet("/", () => Results.Redirect("/flv"));
 
@@ -31,20 +59,26 @@ app.MapGet("/flv", async (HttpContext ctx) =>
     {
         var first = true;
     var reader = sub.Reader;
+    // send init segment for latest SSRC if available
+    if (latestSsrc != 0 && converters.TryGetValue(latestSsrc, out var latestConv) && latestConv.InitSegment != null)
+    {
+        await ctx.Response.Body.WriteAsync(latestConv.InitSegment, ct);
+        await ctx.Response.Body.FlushAsync(ct);
+        first = false; // we already wrote initialization
+    }
+
     await foreach (var payload in reader.ReadAllAsync(ct))
         {
             if (first)
             {
-                // Use library helper to build a minimal FLV file for the first fragment
-                var flv = RtpToFlvConverter.ConvertRtpPayloadToFlvTag(payload, isAudio: false);
-                await ctx.Response.Body.WriteAsync(flv, ct);
+                // first live fragment (if we didn't already send init segment) may be a sequence header produced by converter
+                await ctx.Response.Body.WriteAsync(payload, ct);
                 first = false;
             }
             else
             {
-                // Append only a single tag (no header) for subsequent payloads
-                var tag = BuildFlvTag(payload, isAudio: false);
-                await ctx.Response.Body.WriteAsync(tag, ct);
+                // payload coming from converter already contains a full FLV tag; write as-is
+                await ctx.Response.Body.WriteAsync(payload, ct);
             }
 
             await ctx.Response.Body.FlushAsync(ct);
@@ -57,37 +91,23 @@ app.MapGet("/flv", async (HttpContext ctx) =>
     }
 });
 
+// debug endpoint: return latest init segment for current latest SSRC
+app.MapGet("/flv/init", (HttpContext ctx) =>
+{
+    if (latestSsrc == 0) return Results.NotFound();
+    if (!converters.TryGetValue(latestSsrc, out var conv)) return Results.NotFound();
+    if (conv.InitSegment == null) return Results.NotFound();
+    return Results.File(conv.InitSegment, "application/octet-stream", fileDownloadName: $"init-{latestSsrc}.flv");
+});
+
 app.Lifetime.ApplicationStopping.Register(() => {
     try { cts.Cancel(); } catch { }
+    try { rtpServer.Dispose(); } catch { }
 });
 
 app.Run();
 
-// UDP listener: receive RTP packets and publish their payload to subscribers
-static async Task UdpListenerLoop(int port, PayloadBroadcaster broadcaster, CancellationToken ct)
-{
-    using var udp = new UdpClient(port);
-    try
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            var res = await udp.ReceiveAsync(ct);
-            try
-            {
-                var pkt = RtpPacket.Parse(res.Buffer, 0, res.Buffer.Length);
-                if (pkt.Payload != null && pkt.Payload.Length > 0)
-                {
-                    broadcaster.Broadcast(pkt.Payload);
-                }
-            }
-            catch (Exception)
-            {
-                // ignore parse errors for robustness
-            }
-        }
-    }
-    catch (OperationCanceledException) { }
-}
+// NOTE: UDP listening is handled by RtpServer internally; we subscribe to PacketReceived event above.
 
 // Build a single FLV tag block (tag header + data + previousTagSize)
 static byte[] BuildFlvTag(byte[] payload, bool isAudio)

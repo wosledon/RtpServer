@@ -57,6 +57,7 @@ namespace RtpServer
                 ushort extLenWords = (ushort)((buffer[idx++] << 8) | buffer[idx++]);
                 int extLenBytes = extLenWords * 4;
                 var extEnd = idx + extLenBytes;
+                if (extEnd > offset + length) throw new ArgumentException("Invalid RTP extension length");
                 extensionRaw = new byte[extLenBytes];
                 Array.Copy(buffer, idx, extensionRaw, 0, extLenBytes);
                 if (profile == 0xBE || profile == 0xBede) // One-Byte or Two-Byte

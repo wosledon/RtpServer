@@ -12,6 +12,12 @@ namespace RtpServer
 {
     public sealed class RtpServer : IDisposable
     {
+        /// <summary>
+        /// Event raised when a parsed RTP packet has been received.
+        /// Handlers are invoked on the worker thread — keep handlers fast.
+        /// </summary>
+        public event EventHandler<RtpPacket?>? PacketReceived;
+
         private readonly int _port;
         private readonly ILogger _logger;
         private Socket _socket = null!;
@@ -88,6 +94,15 @@ namespace RtpServer
                 {
                     var pkt = RtpPacket.Parse(item.data, 0, item.length);
                     _logger.LogDebug("Received RTP packet: ssrc={Ssrc} seq={Seq} ts={Ts} payload={PayloadLen}", pkt.Ssrc, pkt.SequenceNumber, pkt.Timestamp, pkt.Payload?.Length ?? 0);
+                    // Notify external subscribers
+                    try
+                    {
+                        PacketReceived?.Invoke(this, pkt);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "PacketReceived handler threw an exception");
+                    }
                 }
                 catch (Exception ex)
                 {
