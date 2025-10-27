@@ -302,9 +302,9 @@ namespace RtpServer.Flv
             ms.WriteByte((byte)(dataSize & 0xFF));
 
             // Timestamp (3 bytes) + TimestampExtended (1)
-            ms.WriteByte((byte)((timestampMs >> 16) & 0xFF));
-            ms.WriteByte((byte)((timestampMs >> 8) & 0xFF));
             ms.WriteByte((byte)(timestampMs & 0xFF));
+            ms.WriteByte((byte)((timestampMs >> 8) & 0xFF));
+            ms.WriteByte((byte)((timestampMs >> 16) & 0xFF));
             ms.WriteByte((byte)((timestampMs >> 24) & 0xFF));
             // StreamID
             ms.Write(new byte[] { 0x00, 0x00, 0x00 }, 0, 3);
